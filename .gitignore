@@ -4,6 +4,7 @@
 __pycache__
 *.pyc
 *.pdf
+test_*.py
 
 # Node / Next.js
 node_modules/
