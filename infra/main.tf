@@ -86,6 +86,53 @@ resource "aws_security_group" "ec2" {
   tags = { Name = "${var.project_name}-ec2-sg" }
 }
 
+# Security group for VPC endpoints
+resource "aws_security_group" "vpce" {
+  name_prefix = "${var.project_name}-vpce-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.main.cidr_block]
+  }
+
+  tags = { Name = "${var.project_name}-vpce-sg" }
+}
+
+# --- VPC Endpoints for SSM (keeps traffic inside AWS network) ---
+
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.public.id]
+  security_group_ids  = [aws_security_group.vpce.id]
+  private_dns_enabled = true
+  tags                = { Name = "${var.project_name}-ssm-vpce" }
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.public.id]
+  security_group_ids  = [aws_security_group.vpce.id]
+  private_dns_enabled = true
+  tags                = { Name = "${var.project_name}-ssmmessages-vpce" }
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.public.id]
+  security_group_ids  = [aws_security_group.vpce.id]
+  private_dns_enabled = true
+  tags                = { Name = "${var.project_name}-ec2messages-vpce" }
+}
+
 # --- IAM Role for EC2 ---
 # SSM only — add more policies later as needed
 
