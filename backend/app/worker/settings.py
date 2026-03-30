@@ -1,4 +1,5 @@
 from arq.connections import RedisSettings
+from arq.cron import cron
 from redis.asyncio import Redis
 
 from app.config import Settings
@@ -23,8 +24,7 @@ async def shutdown(ctx: dict) -> None:
 class WorkerSettings:
     functions = [process_merge_job]
     cron_jobs = [
-        # Run cleanup every 10 minutes
-        cleanup_expired_jobs,
+        cron(cleanup_expired_jobs, minute={0, 10, 20, 30, 40, 50}),
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 2

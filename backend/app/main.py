@@ -27,8 +27,8 @@ def create_app() -> FastAPI:
         expose_headers=["X-PDF-Name", "X-PDF-Size", "X-PDF-Pages"],
     )
 
-    app.include_router(health.router)
-    app.include_router(merge.router)
+    app.include_router(health.router, prefix="/api")
+    app.include_router(merge.router, prefix="/api")
 
     return app
 
