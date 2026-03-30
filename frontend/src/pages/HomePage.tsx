@@ -29,7 +29,7 @@ export function HomePage() {
         </h1>
         <p className="text-lg text-muted-foreground max-w-xl mx-auto">
           Upload your lecture slides, handouts, or documents and combine them
-          into a single, neatly arranged grid PDF.
+          into a single, neatly arranged grid PDF, customized by you.
         </p>
       </div>
 
