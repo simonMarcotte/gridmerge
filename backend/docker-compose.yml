@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  api:
+    build:
+      context: .
+      target: api
+    ports:
+      - "8000:8000"
+    environment:
+      GRIDMERGE_REDIS_URL: redis://redis:6379
+      GRIDMERGE_STORAGE_BASE_PATH: /data/gridmerge
+      GRIDMERGE_CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000"]'
+    volumes:
+      - job-storage:/data/gridmerge
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: .
+      target: worker
+    environment:
+      GRIDMERGE_REDIS_URL: redis://redis:6379
+      GRIDMERGE_STORAGE_BASE_PATH: /data/gridmerge
+    volumes:
+      - job-storage:/data/gridmerge
+    depends_on:
+      - redis
+
+volumes:
+  redis-data:
+  job-storage:
