@@ -152,6 +152,26 @@ async def create_job(
     return {"job_id": job_id, "status": job.status}
 
 
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    redis: Redis = Depends(get_redis),
+    settings: Settings = Depends(get_settings),
+):
+    if not job_id.isalnum() or len(job_id) != 32:
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = await load_job(redis, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        return {"status": job.status}
+    job.status = JobStatus.FAILED
+    job.error = "Cancelled by user"
+    job.progress_message = "Cancelled"
+    await save_job(redis, job, ttl=settings.job_ttl_seconds)
+    return {"status": job.status}
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, redis: Redis = Depends(get_redis)):
     # Validate job_id is a hex string to prevent injection

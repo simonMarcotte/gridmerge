@@ -29,5 +29,7 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 2
     job_timeout = 600
+    max_tries = 3 # Retry up to 3 times (Spot reclamation)
+    retry_delay = 5
     on_startup = startup
     on_shutdown = shutdown

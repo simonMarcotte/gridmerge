@@ -54,6 +54,11 @@ async def process_merge_job(ctx: dict, job_id: str) -> None:
             all_page_paths: list[Path] = []
 
             for i, pdf_path in enumerate(pdf_paths):
+                # Check if job was cancelled
+                fresh = await load_job(redis, job_id)
+                if fresh and fresh.status == JobStatus.FAILED:
+                    return
+
                 job.processed_pdfs = i
                 job.progress = int(i / len(pdf_paths) * 90)
                 job.progress_message = f"Processing PDF {i + 1} of {len(pdf_paths)}..."

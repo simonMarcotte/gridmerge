@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from math import ceil
 from io import BytesIO
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import fitz
 from PIL import Image, ImageDraw, ImageFont
@@ -75,6 +76,58 @@ def _draw_column_separators(
             y += dot_length + gap
 
 
+def _rasterize_page(pdf_path: str, page_idx: int, dpi_scale: int) -> bytes:
+    """Rasterize a single PDF page to PNG bytes. Runs in a separate process."""
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    mat = fitz.Matrix(dpi_scale, dpi_scale)
+    pix = page.get_pixmap(matrix=mat)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    return png_bytes
+
+
+def _build_grid_page(
+    slide_pngs: list[tuple[int, bytes]],
+    has_title: bool,
+    pdf_title: str,
+    opts: dict,
+) -> Image.Image:
+    """Compose a single grid page from pre-rasterized slide PNGs."""
+    page_img = Image.new("RGB", (opts["PAGE_WIDTH"], opts["PAGE_HEIGHT"]), "white")
+
+    if has_title:
+        _draw_title(page_img, pdf_title, opts)
+
+    grid_top, cell_width, cell_height = _get_grid_dimensions(has_title, opts)
+
+    for i, (_, png_bytes) in enumerate(slide_pngs):
+        slide_img = Image.open(BytesIO(png_bytes))
+        slide_img = slide_img.resize((cell_width, cell_height))
+
+        row = i % opts["SLIDES_PER_COLUMN"]
+        col = i // opts["SLIDES_PER_COLUMN"]
+        x = opts["MARGIN"] + col * (cell_width + opts["MARGIN"])
+        y = grid_top + row * (cell_height + opts["MARGIN"])
+        page_img.paste(slide_img, (x, y))
+        del slide_img
+
+    grid_bottom = (
+        grid_top
+        + opts["SLIDES_PER_COLUMN"] * cell_height
+        + (opts["SLIDES_PER_COLUMN"] - 1) * opts["MARGIN"]
+    )
+    _draw_column_separators(
+        ImageDraw.Draw(page_img), grid_top, grid_bottom, cell_width, opts
+    )
+
+    return page_img
+
+
+# Number of parallel rasterization workers
+_MAX_WORKERS = max(1, os.cpu_count() or 1)
+
+
 def process_single_pdf(
     pdf_path: str,
     opts: dict,
@@ -82,65 +135,49 @@ def process_single_pdf(
 ) -> list[Path]:
     """Process one PDF into grid page images saved to disk.
 
-    Returns list of PNG paths. Memory is bounded to one grid page at a time.
+    Uses multiprocessing to rasterize pages in parallel for speed.
+    Returns list of PNG paths.
     """
     pdf_title = os.path.splitext(os.path.basename(pdf_path))[0]
     doc = fitz.open(pdf_path)
     total_slides = len(doc)
+    doc.close()
+
     slides_per_page = opts["SLIDES_PER_COLUMN"] * opts["SLIDES_PER_ROW"]
     num_pages = ceil(total_slides / slides_per_page)
     dpi_scale = opts["DPI_SCALE"]
-    mat = fitz.Matrix(dpi_scale, dpi_scale)
 
     page_paths: list[Path] = []
 
+    # Process each grid page
     for page_num in range(num_pages):
         has_title = page_num == 0 and opts["TITLE_HEIGHT"] > 0
-        page_img = Image.new(
-            "RGB", (opts["PAGE_WIDTH"], opts["PAGE_HEIGHT"]), "white"
-        )
-
-        if has_title:
-            _draw_title(page_img, pdf_title, opts)
-
-        grid_top, cell_width, cell_height = _get_grid_dimensions(has_title, opts)
-
-        # Rasterize only the slides needed for this grid page
         start = page_num * slides_per_page
         end = min(start + slides_per_page, total_slides)
+        slide_indices = list(range(start, end))
 
-        for i, slide_idx in enumerate(range(start, end)):
-            fitz_page = doc[slide_idx]
-            pix = fitz_page.get_pixmap(matrix=mat)
-            slide_img = Image.open(BytesIO(pix.tobytes("png")))
-            slide_img = slide_img.resize((cell_width, cell_height))
+        # Rasterize all slides for this grid page in parallel
+        slide_pngs: dict[int, bytes] = {}
 
-            row = i % opts["SLIDES_PER_COLUMN"]
-            col = i // opts["SLIDES_PER_COLUMN"]
-            x = opts["MARGIN"] + col * (cell_width + opts["MARGIN"])
-            y = grid_top + row * (cell_height + opts["MARGIN"])
-            page_img.paste(slide_img, (x, y))
+        with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_rasterize_page, pdf_path, idx, dpi_scale): idx
+                for idx in slide_indices
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                slide_pngs[idx] = future.result()
 
-            # Free memory immediately
-            del slide_img, pix
-
-        # Draw column separators
-        grid_bottom = (
-            grid_top
-            + opts["SLIDES_PER_COLUMN"] * cell_height
-            + (opts["SLIDES_PER_COLUMN"] - 1) * opts["MARGIN"]
-        )
-        _draw_column_separators(
-            ImageDraw.Draw(page_img), grid_top, grid_bottom, cell_width, opts
-        )
+        # Build the grid page (sorted by original index)
+        ordered = sorted(slide_pngs.items(), key=lambda x: x[0])
+        page_img = _build_grid_page(ordered, has_title, pdf_title, opts)
 
         # Save to disk, free memory
         out_path = work_dir / f"{pdf_title}_page_{page_num:04d}.png"
         page_img.save(out_path, format="PNG")
         page_paths.append(out_path)
-        del page_img
+        del page_img, slide_pngs
 
-    doc.close()
     return page_paths
 
 
