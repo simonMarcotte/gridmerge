@@ -57,9 +57,33 @@ class S3FileStorage:
                         Delete={"Objects": [{"Key": o["Key"]} for o in objects]},
                     )
 
+    async def list_keys(self, prefix: str) -> list[str]:
+        """List all object keys under a prefix."""
+        full_prefix = self._key(prefix)
+        keys: list[str] = []
+        async with self._session.client("s3", region_name=self.region) as s3:
+            paginator = s3.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(Bucket=self.bucket, Prefix=full_prefix):
+                for obj in page.get("Contents", []):
+                    # Strip the storage prefix to return relative keys
+                    k = obj["Key"]
+                    if self.prefix and k.startswith(self.prefix + "/"):
+                        k = k[len(self.prefix) + 1:]
+                    keys.append(k)
+        return keys
+
+    async def download(self, key: str, dest: Path) -> Path:
+        """Download an S3 object to a local file path."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        async with self._session.client("s3", region_name=self.region) as s3:
+            resp = await s3.get_object(Bucket=self.bucket, Key=self._key(key))
+            data = await resp["Body"].read()
+            dest.write_bytes(data)
+        return dest
+
     def local_path(self, key: str) -> Path:
-        """Return a local cache path. Caller must ensure file is downloaded first
-        via save() writing locally, or use the worker's tempdir approach."""
+        """Return a local cache path. For S3, files must be downloaded first
+        via download() before they exist here."""
         local = self._tmp / key
         local.parent.mkdir(parents=True, exist_ok=True)
         return local

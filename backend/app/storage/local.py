@@ -37,6 +37,25 @@ class LocalFileStorage:
     async def size(self, key: str) -> int:
         return self.local_path(key).stat().st_size
 
+    async def list_keys(self, prefix: str) -> list[str]:
+        """List all file keys under a prefix."""
+        path = self.local_path(prefix)
+        if not path.exists():
+            return []
+        keys: list[str] = []
+        for f in path.rglob("*"):
+            if f.is_file():
+                keys.append(str(f.relative_to(self.base)))
+        return keys
+
+    async def download(self, key: str, dest: Path) -> Path:
+        """Copy a local file to dest (for interface compatibility with S3)."""
+        import shutil as _shutil
+        src = self.local_path(key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(src, dest)
+        return dest
+
     async def delete_prefix(self, prefix: str) -> None:
         path = self.local_path(prefix)
         if path.exists():

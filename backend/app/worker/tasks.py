@@ -6,7 +6,6 @@ from redis.asyncio import Redis
 
 from app.config import Settings
 from app.models import Job, JobStatus, load_job, save_job
-from app.storage.local import LocalFileStorage
 from app.services.pdf_merger import (
     DEFAULT_OPTIONS,
     process_single_pdf,
@@ -16,7 +15,7 @@ from app.services.pdf_merger import (
 
 async def process_merge_job(ctx: dict, job_id: str) -> None:
     redis: Redis = ctx["redis"]
-    storage: LocalFileStorage = ctx["storage"]
+    storage = ctx["storage"]
     settings: Settings = ctx["settings"]
 
     job = await load_job(redis, job_id)
@@ -29,19 +28,30 @@ async def process_merge_job(ctx: dict, job_id: str) -> None:
 
     try:
         opts = {**DEFAULT_OPTIONS, **job.options}
-        input_dir = storage.local_path(f"jobs/{job_id}/input")
-        pdf_paths = sorted(input_dir.glob("*.pdf"))
-
-        if not pdf_paths:
-            raise ValueError("No PDF files found")
-
-        job.total_pdfs = len(pdf_paths)
-        await save_job(redis, job, ttl=settings.job_ttl_seconds)
-
-        all_page_paths: list[Path] = []
 
         with tempfile.TemporaryDirectory() as work_dir:
             work_path = Path(work_dir)
+            input_dir = work_path / "input"
+            input_dir.mkdir()
+
+            # Download input PDFs from storage (works for both S3 and local)
+            input_keys = await storage.list_keys(f"jobs/{job_id}/input")
+            pdf_keys = sorted([k for k in input_keys if k.lower().endswith(".pdf")])
+
+            if not pdf_keys:
+                raise ValueError("No PDF files found in storage")
+
+            pdf_paths: list[Path] = []
+            for key in pdf_keys:
+                filename = Path(key).name
+                dest = input_dir / filename
+                await storage.download(key, dest)
+                pdf_paths.append(dest)
+
+            job.total_pdfs = len(pdf_paths)
+            await save_job(redis, job, ttl=settings.job_ttl_seconds)
+
+            all_page_paths: list[Path] = []
 
             for i, pdf_path in enumerate(pdf_paths):
                 job.processed_pdfs = i
@@ -56,13 +66,16 @@ async def process_merge_job(ctx: dict, job_id: str) -> None:
             job.progress_message = "Assembling output PDF..."
             await save_job(redis, job, ttl=settings.job_ttl_seconds)
 
-            output_dir = storage.local_path(f"jobs/{job_id}/output")
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = str(output_dir / "merged.pdf")
+            # Assemble output PDF locally
+            output_path = work_path / "merged.pdf"
+            page_count = assemble_output_pdf(all_page_paths, str(output_path))
 
-            page_count = assemble_output_pdf(all_page_paths, output_path)
+            # Upload result to storage
+            output_key = f"jobs/{job_id}/output/merged.pdf"
+            output_data = output_path.read_bytes()
+            await storage.save(output_key, output_data)
+            output_size = len(output_data)
 
-        output_size = (output_dir / "merged.pdf").stat().st_size
         first_name = job.input_filenames[0] if job.input_filenames else "merged"
         base_name = first_name.rsplit(".", 1)[0] if "." in first_name else first_name
 
@@ -84,19 +97,19 @@ async def process_merge_job(ctx: dict, job_id: str) -> None:
 
 async def cleanup_expired_jobs(ctx: dict) -> None:
     """Periodic task: delete job storage directories whose Redis keys have expired."""
-    storage: LocalFileStorage = ctx["storage"]
+    storage = ctx["storage"]
     redis: Redis = ctx["redis"]
-    jobs_dir = storage.local_path("jobs")
 
-    if not jobs_dir.exists():
-        return
+    # List all job prefixes in storage
+    all_keys = await storage.list_keys("jobs")
+    job_ids = set()
+    for key in all_keys:
+        # keys look like "jobs/<job_id>/input/..." or "jobs/<job_id>/output/..."
+        parts = key.split("/")
+        if len(parts) >= 2:
+            job_ids.add(parts[1])
 
-    now = time.time()
-    for job_dir in jobs_dir.iterdir():
-        if not job_dir.is_dir():
-            continue
-        job_id = job_dir.name
-        # If the Redis key is gone, the job has expired — clean up files
+    for job_id in job_ids:
         exists = await redis.exists(f"job:{job_id}")
         if not exists:
             await storage.delete_prefix(f"jobs/{job_id}")
