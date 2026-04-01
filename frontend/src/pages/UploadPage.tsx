@@ -60,10 +60,12 @@ export function UploadPage() {
     setProgress(null);
     setResult(null);
     try {
+      const name = outputName.trim() || "merged";
       const job = await mergePdfs(
         items.map((i) => i.file),
         settingsToOptions(settings),
         (status) => setProgress(status),
+        `${name.replace(/\.pdf$/i, "")}.pdf`,
       );
       setResult(job);
     } catch (e) {

@@ -34,6 +34,7 @@ export interface MergeResult {
 async function submitJob(
   files: File[],
   options?: MergeOptions,
+  outputName?: string,
 ): Promise<string> {
   const formData = new FormData();
   for (const file of files) {
@@ -41,6 +42,9 @@ async function submitJob(
   }
   if (options) {
     formData.append("options", JSON.stringify(options));
+  }
+  if (outputName) {
+    formData.append("output_name", outputName);
   }
 
   const res = await fetch(`${API_BASE}/api/jobs`, {
@@ -71,6 +75,22 @@ async function downloadJob(jobId: string): Promise<MergeResult> {
     throw new Error(`Download failed (${res.status})`);
   }
 
+  const contentType = res.headers.get("Content-Type") ?? "";
+
+  // S3 presigned URL response (JSON with download_url)
+  if (contentType.includes("application/json")) {
+    const data = await res.json();
+    const blobRes = await fetch(data.download_url);
+    const blob = await blobRes.blob();
+    return {
+      blob,
+      name: data.name ?? "merged.pdf",
+      size: data.size ?? blob.size,
+      pages: data.pages ?? 0,
+    };
+  }
+
+  // Local storage: direct stream
   const blob = await res.blob();
   return {
     blob,
@@ -84,8 +104,9 @@ export async function mergePdfs(
   files: File[],
   options?: MergeOptions,
   onProgress?: (status: JobStatus) => void,
+  outputName?: string,
 ): Promise<JobStatus> {
-  const jobId = await submitJob(files, options);
+  const jobId = await submitJob(files, options, outputName);
 
   // Poll until done — returns job metadata (not the blob yet)
   while (true) {
