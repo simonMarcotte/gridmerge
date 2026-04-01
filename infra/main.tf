@@ -216,14 +216,21 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
   role = aws_iam_role.ecs_task.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
-      Resource = [
-        aws_s3_bucket.storage.arn,
-        "${aws_s3_bucket.storage.arn}/*"
-      ]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+        Resource = [
+          aws_s3_bucket.storage.arn,
+          "${aws_s3_bucket.storage.arn}/*"
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:UpdateService", "ecs:DescribeServices"]
+        Resource = [aws_ecs_service.worker.id]
+      }
+    ]
   })
 }
 
@@ -263,6 +270,8 @@ resource "aws_ecs_task_definition" "api" {
       { name = "GRIDMERGE_STORAGE_BACKEND", value = "s3" },
       { name = "GRIDMERGE_S3_BUCKET",       value = aws_s3_bucket.storage.id },
       { name = "GRIDMERGE_S3_REGION",       value = var.aws_region },
+      { name = "GRIDMERGE_ECS_CLUSTER",     value = var.project_name },
+      { name = "GRIDMERGE_ECS_WORKER_SERVICE", value = "${var.project_name}-worker" },
     ]
     logConfiguration = {
       logDriver = "awslogs"
@@ -334,7 +343,7 @@ resource "aws_ecs_service" "worker" {
   name            = "${var.project_name}-worker"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.worker.arn
-  desired_count   = 1
+  desired_count   = 0
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -342,6 +351,59 @@ resource "aws_ecs_service" "worker" {
     security_groups  = [aws_security_group.fargate.id]
     assign_public_ip = true
   }
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+}
+
+# --- Auto-scaling: scale worker 0→3 based on demand ---
+
+resource "aws_appautoscaling_target" "worker" {
+  max_capacity       = 3
+  min_capacity       = 0
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.worker.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+# Scale down to 0 when CPU is idle for 5 minutes
+resource "aws_appautoscaling_policy" "worker_scale_down" {
+  name               = "${var.project_name}-worker-scale-down"
+  policy_type        = "StepScaling"
+  resource_id        = aws_appautoscaling_target.worker.resource_id
+  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker.service_namespace
+
+  step_scaling_policy_configuration {
+    adjustment_type         = "ExactCapacity"
+    cooldown                = 120
+    metric_aggregation_type = "Average"
+
+    step_adjustment {
+      scaling_adjustment          = 0
+      metric_interval_upper_bound = 0
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_idle" {
+  alarm_name          = "${var.project_name}-worker-idle"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ECS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 5
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.worker.name
+  }
+
+  alarm_actions = [aws_appautoscaling_policy.worker_scale_down.arn]
 }
 
 # --- S3 Buckets ---
@@ -350,6 +412,18 @@ resource "aws_ecs_service" "worker" {
 resource "aws_s3_bucket" "storage" {
   bucket_prefix = "${var.project_name}-storage-"
   force_destroy = true
+}
+
+# Allow browser to fetch presigned URLs cross-origin
+resource "aws_s3_bucket_cors_configuration" "storage" {
+  bucket = aws_s3_bucket.storage.id
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET"]
+    allowed_origins = ["*"]
+    expose_headers  = ["Content-Disposition", "Content-Type", "Content-Length"]
+    max_age_seconds = 3600
+  }
 }
 
 # Auto-delete old job files after 1 day
