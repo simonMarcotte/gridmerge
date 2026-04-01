@@ -247,6 +247,11 @@ resource "aws_ecs_cluster" "main" {
   name = var.project_name
 }
 
+resource "aws_ecs_cluster_capacity_providers" "main" {
+  cluster_name       = aws_ecs_cluster.main.name
+  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+}
+
 # API task definition
 resource "aws_ecs_task_definition" "api" {
   family                   = "${var.project_name}-api"
@@ -289,8 +294,8 @@ resource "aws_ecs_task_definition" "worker" {
   family                   = "${var.project_name}-worker"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = 512
-  memory                   = 1024
+  cpu                      = 2048
+  memory                   = 4096
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
@@ -338,13 +343,25 @@ resource "aws_ecs_service" "api" {
   depends_on = [aws_lb_listener.api]
 }
 
-# Worker service
+# Worker service (starts at 0, API wakes it up on demand)
+# Uses Fargate Spot for ~70% cost savings (PDF processing is interruptible)
 resource "aws_ecs_service" "worker" {
   name            = "${var.project_name}-worker"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.worker.arn
   desired_count   = 0
-  launch_type     = "FARGATE"
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 4
+    base              = 0
+  }
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+    base              = 0
+  }
 
   network_configuration {
     subnets          = data.aws_subnets.default.ids
@@ -357,7 +374,46 @@ resource "aws_ecs_service" "worker" {
   }
 }
 
-# --- Auto-scaling: scale worker 0→3 based on demand ---
+# =============================================================================
+# Auto-scaling
+# =============================================================================
+#
+# API:    always 1, scales to 4 under load (target tracking, fully automatic)
+# Worker: starts at 0, API wakes to 1, scales to 5 under load, back to 0 idle
+#
+# Target tracking = "keep CPU around X%" — AWS handles the rest automatically.
+# The only manual piece is the worker's scale-to-zero, since target tracking
+# won't remove the last task.
+
+# --- API auto-scaling (1→4) ---
+
+resource "aws_appautoscaling_target" "api" {
+  max_capacity       = 2
+  min_capacity       = 1
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.api.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "api_cpu" {
+  name               = "${var.project_name}-api-cpu"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.api.resource_id
+  scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.api.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = 70.0
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 60
+
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+  }
+}
+
+# --- Worker auto-scaling (0→5) ---
 
 resource "aws_appautoscaling_target" "worker" {
   max_capacity       = 3
@@ -367,9 +423,28 @@ resource "aws_appautoscaling_target" "worker" {
   service_namespace  = "ecs"
 }
 
-# Scale down to 0 when CPU is idle for 5 minutes
-resource "aws_appautoscaling_policy" "worker_scale_down" {
-  name               = "${var.project_name}-worker-scale-down"
+# Target tracking: scales 1→5 automatically when workers are busy
+resource "aws_appautoscaling_policy" "worker_cpu" {
+  name               = "${var.project_name}-worker-cpu"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.worker.resource_id
+  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = 70.0
+    scale_in_cooldown  = 120
+    scale_out_cooldown = 60
+
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+  }
+}
+
+# Scale-to-zero: target tracking won't remove the last task, so we need this
+resource "aws_appautoscaling_policy" "worker_scale_to_zero" {
+  name               = "${var.project_name}-worker-scale-to-zero"
   policy_type        = "StepScaling"
   resource_id        = aws_appautoscaling_target.worker.resource_id
   scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
@@ -390,7 +465,7 @@ resource "aws_appautoscaling_policy" "worker_scale_down" {
 resource "aws_cloudwatch_metric_alarm" "worker_idle" {
   alarm_name          = "${var.project_name}-worker-idle"
   comparison_operator = "LessThanOrEqualToThreshold"
-  evaluation_periods  = 3
+  evaluation_periods  = 5
   metric_name         = "CPUUtilization"
   namespace           = "AWS/ECS"
   period              = 60
@@ -403,7 +478,7 @@ resource "aws_cloudwatch_metric_alarm" "worker_idle" {
     ServiceName = aws_ecs_service.worker.name
   }
 
-  alarm_actions = [aws_appautoscaling_policy.worker_scale_down.arn]
+  alarm_actions = [aws_appautoscaling_policy.worker_scale_to_zero.arn]
 }
 
 # --- S3 Buckets ---
