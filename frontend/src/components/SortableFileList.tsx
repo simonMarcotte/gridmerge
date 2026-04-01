@@ -20,6 +20,14 @@ import { GripVertical, X, FileText } from "lucide-react";
 export interface PdfItem {
   id: string;
   file: File;
+  pageCount?: number;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
 }
 
 interface SortableFileListProps {
@@ -63,7 +71,8 @@ function SortableItem({
       <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
       <span className="text-sm truncate flex-1">{item.file.name}</span>
       <span className="text-xs text-muted-foreground shrink-0">
-        {(item.file.size / 1024).toFixed(0)} KB
+        {item.pageCount != null && `${item.pageCount} pg · `}
+        {formatSize(item.file.size)}
       </span>
       <button
         type="button"

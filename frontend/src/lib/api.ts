@@ -31,7 +31,57 @@ export interface MergeResult {
   pages: number;
 }
 
-async function submitJob(
+// --- Presigned upload flow (S3 mode: fast, parallel uploads) ---
+
+async function submitJobPresigned(
+  files: File[],
+  options?: MergeOptions,
+  outputName?: string,
+): Promise<string> {
+  // Step 1: Get presigned upload URLs from API
+  const prepareRes = await fetch(`${API_BASE}/api/jobs/prepare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      files: files.map((f) => ({ name: f.name, size: f.size })),
+      options: options ?? {},
+      output_name: outputName ?? null,
+    }),
+  });
+
+  if (!prepareRes.ok) {
+    const text = await prepareRes.text();
+    throw new Error(text || `Prepare failed (${prepareRes.status})`);
+  }
+
+  const { job_id, upload_urls } = await prepareRes.json();
+
+  // Step 2: Upload all files directly to S3 in parallel
+  const uploads = files.map((file, i) =>
+    fetch(upload_urls[i].url, {
+      method: "PUT",
+      body: file,
+      headers: { "Content-Type": "application/pdf" },
+    }).then((res) => {
+      if (!res.ok) throw new Error(`Upload failed for ${file.name}`);
+    }),
+  );
+  await Promise.all(uploads);
+
+  // Step 3: Tell API all files are uploaded, start processing
+  const startRes = await fetch(`${API_BASE}/api/jobs/${job_id}/start`, {
+    method: "POST",
+  });
+  if (!startRes.ok) {
+    throw new Error(`Failed to start job (${startRes.status})`);
+  }
+
+  return job_id;
+}
+
+// --- Legacy multipart upload flow (local storage fallback) ---
+
+async function submitJobMultipart(
   files: File[],
   options?: MergeOptions,
   outputName?: string,
@@ -59,6 +109,20 @@ async function submitJob(
 
   const data = await res.json();
   return data.job_id;
+}
+
+// Try presigned first, fall back to multipart
+async function submitJob(
+  files: File[],
+  options?: MergeOptions,
+  outputName?: string,
+): Promise<string> {
+  try {
+    return await submitJobPresigned(files, options, outputName);
+  } catch {
+    // Presigned not available (local dev) — fall back to multipart
+    return await submitJobMultipart(files, options, outputName);
+  }
 }
 
 async function pollJob(jobId: string): Promise<JobStatus> {

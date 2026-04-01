@@ -9,6 +9,12 @@ import { Button } from "@/components/ui/button";
 import { Loader2, Download, FileText, X } from "lucide-react";
 import { mergePdfs, downloadMergedPdf } from "@/lib/api";
 import type { MergeOptions, JobStatus } from "@/lib/api";
+import * as pdfjsLib from "pdfjs-dist";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url,
+).toString();
 
 let nextId = 0;
 
@@ -46,9 +52,27 @@ export function UploadPage() {
     const newItems = files.map((file) => ({
       id: `pdf-${++nextId}`,
       file,
+      pageCount: undefined as number | undefined,
     }));
     setItems((prev) => [...prev, ...newItems]);
     setError(null);
+
+    // Count pages in background
+    for (const item of newItems) {
+      const url = URL.createObjectURL(item.file);
+      pdfjsLib
+        .getDocument(url)
+        .promise.then((doc) => {
+          setItems((prev) =>
+            prev.map((i) =>
+              i.id === item.id ? { ...i, pageCount: doc.numPages } : i,
+            ),
+          );
+          doc.destroy();
+        })
+        .catch(() => {})
+        .finally(() => URL.revokeObjectURL(url));
+    }
   }, []);
 
   const removeItem = useCallback((id: string) => {
@@ -134,16 +158,16 @@ export function UploadPage() {
               <label htmlFor="output-name" className="text-sm font-medium">
                 Output filename
               </label>
-              <div className="flex items-stretch">
+              <div className="flex items-stretch rounded-lg border border-input focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:ring-offset-background">
                 <Input
                   id="output-name"
                   value={outputName}
                   onChange={(e) => setOutputName(e.target.value)}
                   placeholder="merged"
-                  className="rounded-r-none border-r-0"
+                  className="rounded-r-none border-0 focus-visible:ring-0 focus-visible:ring-offset-0"
                   disabled={loading}
                 />
-                <span className="inline-flex items-center rounded-r-lg border border-input bg-muted px-3 text-sm text-muted-foreground">
+                <span className="inline-flex items-center border-l border-input bg-muted px-3 text-sm text-muted-foreground rounded-r-lg">
                   .pdf
                 </span>
               </div>

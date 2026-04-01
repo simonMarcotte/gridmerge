@@ -22,10 +22,10 @@ const PAGE_SIZES: Record<string, { PAGE_WIDTH: number; PAGE_HEIGHT: number }> = 
 };
 
 const QUALITY_PRESETS: Record<string, number> = {
-  Draft: 1,
+  Low: 1,
   Standard: 2,
-  High: 4,
-  Ultra: 6,
+  High: 3,
+  Ultra: 4,
 };
 
 const TITLE_SIZE_PRESETS: Record<string, number> = {
@@ -52,7 +52,7 @@ export const DEFAULT_SETTINGS: SettingsState = {
   TITLE_HEIGHT: 200,
   SLIDES_PER_ROW: 2,
   SLIDES_PER_COLUMN: 3,
-  DPI_SCALE: 4,
+  DPI_SCALE: 2,
   showTitles: true,
 };
 
