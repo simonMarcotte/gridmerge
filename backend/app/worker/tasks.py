@@ -76,14 +76,16 @@ async def process_merge_job(ctx: dict, job_id: str) -> None:
             await storage.save(output_key, output_data)
             output_size = len(output_data)
 
-        first_name = job.input_filenames[0] if job.input_filenames else "merged"
-        base_name = first_name.rsplit(".", 1)[0] if "." in first_name else first_name
+        # Use the user-provided name if set, otherwise derive from first input
+        if not job.output_filename:
+            first_name = job.input_filenames[0] if job.input_filenames else "merged"
+            base_name = first_name.rsplit(".", 1)[0] if "." in first_name else first_name
+            job.output_filename = f"{base_name}_merged.pdf"
 
         job.status = JobStatus.COMPLETED
         job.progress = 100
         job.processed_pdfs = len(pdf_paths)
         job.progress_message = "Done"
-        job.output_filename = f"{base_name}_merged.pdf"
         job.output_pages = page_count
         job.output_size = output_size
         await save_job(redis, job, ttl=settings.job_ttl_seconds)

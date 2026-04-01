@@ -4,7 +4,7 @@ import uuid
 import asyncio
 
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from redis.asyncio import Redis
 
 from app.deps import get_redis, get_storage, get_settings
@@ -42,6 +42,7 @@ async def _check_rate_limit(redis: Redis, settings: Settings) -> None:
 async def create_job(
     files: list[UploadFile] = File(...),
     options: str = Form(None),
+    output_name: str = Form(None),
     redis: Redis = Depends(get_redis),
     storage: LocalFileStorage = Depends(get_storage),
     settings: Settings = Depends(get_settings),
@@ -98,12 +99,21 @@ async def create_job(
         await storage.save(storage_key, data)
         filenames.append(file.filename)
 
+    # Sanitize the user-provided output name
+    if output_name:
+        safe_output = sanitize_filename(output_name)
+        if not safe_output.lower().endswith(".pdf"):
+            safe_output += ".pdf"
+    else:
+        safe_output = None
+
     # Create job record
     job = Job(
         id=job_id,
         total_pdfs=len(filenames),
         options=options_dict,
         input_filenames=filenames,
+        output_filename=safe_output,
     )
     await save_job(redis, job, ttl=settings.job_ttl_seconds)
 
@@ -149,6 +159,16 @@ async def download_job(
 
     # Sanitize output filename for Content-Disposition header
     safe_output_name = sanitize_filename(job.output_filename or "merged.pdf")
+
+    # If using S3, return a presigned URL for direct download (faster)
+    if hasattr(storage, "presigned_url"):
+        url = await storage.presigned_url(output_key, filename=safe_output_name)
+        return JSONResponse({
+            "download_url": url,
+            "name": safe_output_name,
+            "size": job.output_size or 0,
+            "pages": job.output_pages or 0,
+        })
 
     return StreamingResponse(
         storage.stream(output_key),

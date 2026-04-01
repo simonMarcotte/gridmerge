@@ -81,6 +81,17 @@ class S3FileStorage:
             dest.write_bytes(data)
         return dest
 
+    async def presigned_url(self, key: str, expires_in: int = 300, filename: str | None = None) -> str:
+        """Generate a presigned download URL (S3 only)."""
+        params = {"Bucket": self.bucket, "Key": self._key(key)}
+        if filename:
+            params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
+            params["ResponseContentType"] = "application/pdf"
+        async with self._session.client("s3", region_name=self.region) as s3:
+            return await s3.generate_presigned_url(
+                "get_object", Params=params, ExpiresIn=expires_in,
+            )
+
     def local_path(self, key: str) -> Path:
         """Return a local cache path. For S3, files must be downloaded first
         via download() before they exist here."""
