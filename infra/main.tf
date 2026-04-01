@@ -229,6 +229,14 @@ resource "aws_iam_role_policy" "ecs_task_s3" {
         Effect   = "Allow"
         Action   = ["ecs:UpdateService", "ecs:DescribeServices"]
         Resource = [aws_ecs_service.worker.id]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = ["*"]
+        Condition = {
+          StringEquals = { "cloudwatch:namespace" = "GridMerge" }
+        }
       }
     ]
   })
@@ -414,16 +422,75 @@ resource "aws_appautoscaling_policy" "api_cpu" {
 }
 
 # --- Worker auto-scaling (0→5) ---
+#
+# Uses two strategies together:
+#
+#   SCALE UP  → queue depth (custom CloudWatch metric from API)
+#     0→1: API calls ECS directly when first job arrives
+#     1→5: alarm fires when 3+ jobs pending, adds 1 per 2 min
+#     Why: a single heavy PDF pegs CPU at 100% but doesn't mean we
+#          need more workers if there's nothing else in the queue.
+#
+#   SCALE DOWN → CPU target tracking (AWS managed, automatic)
+#     5→2: when workers finish jobs, CPU drops, AWS removes extras
+#     Why: gradual and automatic. If a steady trickle of jobs keeps
+#          2 workers at 60% CPU, it stays at 2 instead of jumping to 0.
+#
+#   SCALE TO ZERO → idle alarm (custom, handles the final 1→0)
+#     1→0: target tracking won't remove the last worker, so a
+#          separate alarm kills it after 5 min of idle.
+#
+# Cost at max scale: 5 Spot workers × $0.04/hr = $0.20/hr
+# Cost when idle: $0
 
 resource "aws_appautoscaling_target" "worker" {
-  max_capacity       = 3
+  max_capacity       = 5
   min_capacity       = 0
   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.worker.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
 }
 
-# Target tracking: scales 1→5 automatically when workers are busy
+# Scale up: 3+ pending jobs → add 1 worker (hard cap at 5)
+# Queue depth is better for scale-up because CPU can spike on a single
+# heavy job without meaning we need more workers.
+resource "aws_appautoscaling_policy" "worker_scale_up" {
+  name               = "${var.project_name}-worker-scale-up"
+  policy_type        = "StepScaling"
+  resource_id        = aws_appautoscaling_target.worker.resource_id
+  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker.service_namespace
+
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = 120
+    metric_aggregation_type = "Maximum"
+
+    step_adjustment {
+      scaling_adjustment          = 1
+      metric_interval_lower_bound = 0
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_queue_high" {
+  alarm_name          = "${var.project_name}-worker-queue-high"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "QueueDepth"
+  namespace           = "GridMerge"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 3
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_appautoscaling_policy.worker_scale_up.arn]
+}
+
+# Gradual scale-down: CPU target tracking handles 5→3→2→1 naturally.
+# When workers finish jobs and CPU drops, AWS removes excess workers.
+# This is better than queue depth for scale-down because workers stay
+# busy for a while after picking up a job (queue empties before CPU drops).
 resource "aws_appautoscaling_policy" "worker_cpu" {
   name               = "${var.project_name}-worker-cpu"
   policy_type        = "TargetTrackingScaling"
@@ -432,9 +499,9 @@ resource "aws_appautoscaling_policy" "worker_cpu" {
   service_namespace  = aws_appautoscaling_target.worker.service_namespace
 
   target_tracking_scaling_policy_configuration {
-    target_value       = 70.0
-    scale_in_cooldown  = 120
-    scale_out_cooldown = 60
+    target_value       = 60.0
+    scale_in_cooldown  = 180
+    scale_out_cooldown = 300  # slow scale-out (queue alarm handles fast scale-up)
 
     predefined_metric_specification {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"
@@ -442,7 +509,8 @@ resource "aws_appautoscaling_policy" "worker_cpu" {
   }
 }
 
-# Scale-to-zero: target tracking won't remove the last task, so we need this
+# Scale to zero: target tracking won't remove the last worker, so this
+# alarm handles the final 1→0 transition when fully idle.
 resource "aws_appautoscaling_policy" "worker_scale_to_zero" {
   name               = "${var.project_name}-worker-scale-to-zero"
   policy_type        = "StepScaling"
@@ -494,7 +562,7 @@ resource "aws_s3_bucket_cors_configuration" "storage" {
   bucket = aws_s3_bucket.storage.id
   cors_rule {
     allowed_headers = ["*"]
-    allowed_methods = ["GET"]
+    allowed_methods = ["GET", "PUT"]
     allowed_origins = ["*"]
     expose_headers  = ["Content-Disposition", "Content-Type", "Content-Length"]
     max_age_seconds = 3600
