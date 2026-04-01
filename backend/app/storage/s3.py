@@ -81,6 +81,15 @@ class S3FileStorage:
             dest.write_bytes(data)
         return dest
 
+    async def presigned_upload_url(self, key: str, expires_in: int = 300) -> str:
+        """Generate a presigned URL for uploading a file directly to S3."""
+        async with self._session.client("s3", region_name=self.region) as s3:
+            return await s3.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": self.bucket, "Key": self._key(key)},
+                ExpiresIn=expires_in,
+            )
+
     async def presigned_url(self, key: str, expires_in: int = 300, filename: str | None = None) -> str:
         """Generate a presigned download URL (S3 only)."""
         params = {"Bucket": self.bucket, "Key": self._key(key)}

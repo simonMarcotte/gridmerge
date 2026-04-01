@@ -46,6 +46,13 @@ async def process_merge_job(ctx: dict, job_id: str) -> None:
                 filename = Path(key).name
                 dest = input_dir / filename
                 await storage.download(key, dest)
+
+                # Validate PDF magic bytes (presigned uploads skip API validation)
+                with open(dest, "rb") as f:
+                    header = f.read(4)
+                if not header.startswith(b"%PDF"):
+                    raise ValueError(f"{filename} is not a valid PDF")
+
                 pdf_paths.append(dest)
 
             job.total_pdfs = len(pdf_paths)

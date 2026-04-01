@@ -5,6 +5,7 @@ import asyncio
 
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 from redis.asyncio import Redis
 
 from app.deps import get_redis, get_storage, get_settings
@@ -15,6 +16,32 @@ from app.models import Job, JobStatus, load_job, save_job
 router = APIRouter()
 
 PDF_MAGIC = b"%PDF"
+
+
+async def _publish_queue_depth(redis: Redis, settings: Settings) -> None:
+    """Publish pending job count to CloudWatch for auto-scaling."""
+    if not settings.ecs_cluster:
+        return
+    try:
+        import boto3
+        # Count pending/processing jobs in Redis
+        keys = await redis.keys("job:*")
+        pending = 0
+        for key in keys:
+            data = await redis.get(key)
+            if data and ('"pending"' in data or '"processing"' in data):
+                pending += 1
+        cw = boto3.client("cloudwatch", region_name=settings.s3_region)
+        cw.put_metric_data(
+            Namespace="GridMerge",
+            MetricData=[{
+                "MetricName": "QueueDepth",
+                "Value": pending,
+                "Unit": "Count",
+            }],
+        )
+    except Exception:
+        pass  # Non-critical
 
 
 async def _ensure_worker_running(settings: Settings) -> None:
@@ -38,15 +65,18 @@ async def _ensure_worker_running(settings: Settings) -> None:
     except Exception:
         pass  # Non-critical — job stays in queue, worker will eventually start
 
-# Regex: keep only alphanumeric, spaces, hyphens, underscores, dots
-_SAFE_FILENAME_RE = re.compile(r"[^\w\s\-.]", re.UNICODE)
+# Regex: keep only alphanumeric, hyphens, underscores, dots
+_SAFE_FILENAME_RE = re.compile(r"[^\w\-.]", re.UNICODE)
 
 
 def sanitize_filename(name: str) -> str:
-    """Strip dangerous characters from a filename."""
+    """Strip dangerous characters, replace spaces with hyphens."""
+    # Replace spaces with hyphens first
+    name = name.replace(" ", "-")
     name = _SAFE_FILENAME_RE.sub("", name)
-    # Collapse whitespace/dots, prevent empty
-    name = name.strip(". ")
+    # Collapse multiple hyphens/dots, strip edges
+    name = re.sub(r"-{2,}", "-", name)
+    name = name.strip("-. ")
     return name or "file"
 
 
@@ -60,6 +90,111 @@ async def _check_rate_limit(redis: Redis, settings: Settings) -> None:
         raise HTTPException(status_code=429, detail="Too many requests, try again later")
 
 
+# --- Presigned upload flow (S3 mode) ---
+
+class FileInfo(BaseModel):
+    name: str
+    size: int
+
+
+class PrepareJobRequest(BaseModel):
+    files: list[FileInfo]
+    options: dict | None = None
+    output_name: str | None = None
+
+
+@router.post("/jobs/prepare", status_code=200)
+async def prepare_job(
+    body: PrepareJobRequest,
+    redis: Redis = Depends(get_redis),
+    storage=Depends(get_storage),
+    settings: Settings = Depends(get_settings),
+):
+    """Create a job and return presigned upload URLs for each file.
+    Only available when using S3 storage."""
+    if not hasattr(storage, "presigned_upload_url"):
+        raise HTTPException(status_code=400, detail="Presigned uploads not available")
+
+    await _check_rate_limit(redis, settings)
+
+    if len(body.files) < 1:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+    if len(body.files) > settings.max_files:
+        raise HTTPException(status_code=400, detail=f"Too many files (max {settings.max_files})")
+
+    max_bytes = settings.max_upload_size_mb * 1024 * 1024
+    job_id = uuid.uuid4().hex
+    upload_urls: list[dict] = []
+    filenames: list[str] = []
+
+    for idx, f in enumerate(body.files):
+        if not f.name.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        if f.size > max_bytes:
+            raise HTTPException(status_code=400, detail=f"{f.name} exceeds {settings.max_upload_size_mb}MB limit")
+
+        safe_name = sanitize_filename(f.name)
+        if not safe_name.lower().endswith(".pdf"):
+            safe_name += ".pdf"
+
+        storage_key = f"jobs/{job_id}/input/{idx:03d}_{safe_name}"
+        url = await storage.presigned_upload_url(storage_key)
+        upload_urls.append({"key": storage_key, "url": url})
+        filenames.append(f.name)
+
+    # Validate and clamp options
+    raw_options = body.options or {}
+    options_dict = validate_options(raw_options)
+
+    # Sanitize output name
+    if body.output_name:
+        safe_output = sanitize_filename(body.output_name)
+        if not safe_output.lower().endswith(".pdf"):
+            safe_output += ".pdf"
+    else:
+        safe_output = None
+
+    # Create job in PENDING state (not enqueued yet — files haven't uploaded)
+    job = Job(
+        id=job_id,
+        total_pdfs=len(filenames),
+        options=options_dict,
+        input_filenames=filenames,
+        output_filename=safe_output,
+    )
+    await save_job(redis, job, ttl=settings.job_ttl_seconds)
+
+    return {"job_id": job_id, "upload_urls": upload_urls}
+
+
+@router.post("/jobs/{job_id}/start", status_code=202)
+async def start_job(
+    job_id: str,
+    redis: Redis = Depends(get_redis),
+    settings: Settings = Depends(get_settings),
+):
+    """Called after all files are uploaded to S3. Enqueues the job for processing."""
+    if not job_id.isalnum() or len(job_id) != 32:
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+
+    job = await load_job(redis, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.PENDING:
+        raise HTTPException(status_code=409, detail="Job already started")
+
+    from arq import ArqRedis
+    arq = ArqRedis.from_url(settings.redis_url)
+    await arq.enqueue_job("process_merge_job", job_id)
+    await arq.aclose()
+
+    await _ensure_worker_running(settings)
+    await _publish_queue_depth(redis, settings)
+
+    return {"job_id": job_id, "status": "processing"}
+
+
+# --- Legacy multipart upload flow (local storage / fallback) ---
 @router.post("/jobs", status_code=202)
 async def create_job(
     files: list[UploadFile] = File(...),
@@ -148,6 +283,7 @@ async def create_job(
 
     # Wake up worker if scaled to zero
     await _ensure_worker_running(settings)
+    await _publish_queue_depth(redis, settings)
 
     return {"job_id": job_id, "status": job.status}
 
@@ -237,7 +373,7 @@ async def merge_pdfs_sync(
     settings: Settings = Depends(get_settings),
 ):
     """Synchronous wrapper: creates a job, polls until done, returns PDF."""
-    response = await create_job(files, options, redis, storage, settings)
+    response = await create_job(files, options, None, redis, storage, settings)
     job_id = response["job_id"]
 
     for _ in range(300):
