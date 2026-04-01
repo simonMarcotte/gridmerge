@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     max_files: int = 20
     job_ttl_seconds: int = 3600
     rate_limit_per_minute: int = 30
+    ecs_cluster: str = ""
+    ecs_worker_service: str = ""
     cors_origins: list[str] = [
         "http://localhost:3000",
         "http://localhost:5173",

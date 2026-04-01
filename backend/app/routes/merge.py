@@ -16,6 +16,28 @@ router = APIRouter()
 
 PDF_MAGIC = b"%PDF"
 
+
+async def _ensure_worker_running(settings: Settings) -> None:
+    """If using ECS, ensure at least 1 worker task is running."""
+    if not settings.ecs_cluster or not settings.ecs_worker_service:
+        return
+    try:
+        import boto3
+        ecs = boto3.client("ecs", region_name=settings.s3_region)
+        resp = ecs.describe_services(
+            cluster=settings.ecs_cluster,
+            services=[settings.ecs_worker_service],
+        )
+        service = resp["services"][0]
+        if service["desiredCount"] == 0:
+            ecs.update_service(
+                cluster=settings.ecs_cluster,
+                service=settings.ecs_worker_service,
+                desiredCount=1,
+            )
+    except Exception:
+        pass  # Non-critical — job stays in queue, worker will eventually start
+
 # Regex: keep only alphanumeric, spaces, hyphens, underscores, dots
 _SAFE_FILENAME_RE = re.compile(r"[^\w\s\-.]", re.UNICODE)
 
@@ -123,6 +145,9 @@ async def create_job(
     arq = ArqRedis.from_url(settings.redis_url)
     await arq.enqueue_job("process_merge_job", job_id)
     await arq.aclose()
+
+    # Wake up worker if scaled to zero
+    await _ensure_worker_running(settings)
 
     return {"job_id": job_id, "status": job.status}
 

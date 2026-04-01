@@ -9,3 +9,4 @@ redis[hiredis]>=5.0
 pydantic-settings>=2.0
 aiofiles>=24.0
 aioboto3>=13.0
+boto3>=1.35
