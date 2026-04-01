@@ -105,13 +105,19 @@ export async function mergePdfs(
   options?: MergeOptions,
   onProgress?: (status: JobStatus) => void,
   outputName?: string,
+  signal?: AbortSignal,
 ): Promise<JobStatus> {
   const jobId = await submitJob(files, options, outputName);
 
   // Poll until done — returns job metadata (not the blob yet)
   while (true) {
+    if (signal?.aborted) {
+      await cancelJob(jobId);
+      throw new DOMException("Cancelled", "AbortError");
+    }
     await new Promise((r) => setTimeout(r, 800));
     const status = await pollJob(jobId);
+    status.id = jobId;
     onProgress?.(status);
 
     if (status.status === "completed") {
@@ -121,6 +127,10 @@ export async function mergePdfs(
       throw new Error(status.error ?? "Merge failed");
     }
   }
+}
+
+export async function cancelJob(jobId: string): Promise<void> {
+  await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "POST" });
 }
 
 export async function downloadMergedPdf(jobId: string): Promise<Blob> {

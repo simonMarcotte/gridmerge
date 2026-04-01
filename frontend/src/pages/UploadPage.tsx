@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { FileDropzone } from "@/components/FileDropzone";
 import { SortableFileList } from "@/components/SortableFileList";
 import type { PdfItem } from "@/components/SortableFileList";
@@ -26,8 +26,9 @@ function settingsToOptions(s: SettingsState): MergeOptions {
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
 }
 
 export function UploadPage() {
@@ -39,6 +40,7 @@ export function UploadPage() {
   const [result, setResult] = useState<JobStatus | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const addFiles = useCallback((files: File[]) => {
     const newItems = files.map((file) => ({
@@ -55,6 +57,8 @@ export function UploadPage() {
 
   const handleMerge = async () => {
     if (items.length < 1) return;
+    const abort = new AbortController();
+    abortRef.current = abort;
     setLoading(true);
     setError(null);
     setProgress(null);
@@ -66,14 +70,24 @@ export function UploadPage() {
         settingsToOptions(settings),
         (status) => setProgress(status),
         `${name.replace(/\.pdf$/i, "")}.pdf`,
+        abort.signal,
       );
       setResult(job);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
+      if (e instanceof DOMException && e.name === "AbortError") {
+        setError(null); // User cancelled, no error
+      } else {
+        setError(e instanceof Error ? e.message : "Something went wrong");
+      }
     } finally {
       setLoading(false);
       setProgress(null);
+      abortRef.current = null;
     }
+  };
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
   };
 
   const handleDownload = async () => {
@@ -150,11 +164,21 @@ export function UploadPage() {
 
           {loading && progress && (
             <div className="flex flex-col gap-1.5">
-              <div className="h-2 rounded-full bg-muted overflow-hidden">
-                <div
-                  className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
-                  style={{ width: `${progress.progress}%` }}
-                />
+              <div className="flex items-center gap-2">
+                <div className="h-2 rounded-full bg-muted overflow-hidden flex-1">
+                  <div
+                    className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${progress.progress}%` }}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancel}
+                  className="text-muted-foreground hover:text-destructive transition-colors"
+                  aria-label="Cancel merge"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
               <p className="text-xs text-muted-foreground">
                 {progress.progress_message || "Starting..."}
