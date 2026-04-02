@@ -197,7 +197,6 @@ export async function cancelJob(jobId: string): Promise<void> {
   await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: "POST" });
 }
 
-export async function downloadMergedPdf(jobId: string): Promise<Blob> {
-  const result = await downloadJob(jobId);
-  return result.blob;
+export async function downloadMergedPdf(jobId: string): Promise<MergeResult> {
+  return downloadJob(jobId);
 }

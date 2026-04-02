@@ -118,14 +118,12 @@ export function UploadPage() {
     if (!result) return;
     setDownloading(true);
     try {
-      const blob = await downloadMergedPdf(result.id);
-      const url = URL.createObjectURL(blob);
+      const mergeResult = await downloadMergedPdf(result.id);
+      const url = URL.createObjectURL(mergeResult.blob);
       const a = document.createElement("a");
       a.href = url;
-      const name = outputName.trim()
-        ? `${outputName.trim().replace(/\.pdf$/i, "")}.pdf`
-        : "merged.pdf";
-      a.download = name;
+      // Use the backend's canonical filename (sanitized, with GRIDMERGE_ prefix)
+      a.download = mergeResult.name;
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {
@@ -221,9 +219,7 @@ export function UploadPage() {
               </div>
               <div>
                 <p className="text-sm font-medium">
-                  {outputName.trim()
-                    ? `${outputName.trim().replace(/\.pdf$/i, "")}.pdf`
-                    : "merged.pdf"}
+                  {result.output_filename || "merged.pdf"}
                 </p>
                 <div className="flex items-center gap-2 mt-0.5">
                   <span className="text-xs text-muted-foreground">
