@@ -3,7 +3,7 @@ import re
 import uuid
 import asyncio
 
-from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
+from fastapi import APIRouter, BackgroundTasks, File, UploadFile, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from redis.asyncio import Redis
@@ -70,14 +70,26 @@ _SAFE_FILENAME_RE = re.compile(r"[^\w\-.]", re.UNICODE)
 
 
 def sanitize_filename(name: str) -> str:
-    """Strip dangerous characters, replace spaces with hyphens."""
-    # Replace spaces with hyphens first
-    name = name.replace(" ", "-")
+    """Strip dangerous characters, replace spaces with underscores."""
+    # Replace spaces with underscores first
+    name = name.replace(" ", "_")
     name = _SAFE_FILENAME_RE.sub("", name)
-    # Collapse multiple hyphens/dots, strip edges
+    # Collapse multiple underscores/hyphens/dots, strip edges
+    name = re.sub(r"_{2,}", "_", name)
     name = re.sub(r"-{2,}", "-", name)
-    name = name.strip("-. ")
+    name = name.strip("-_. ")
     return name or "file"
+
+
+def _safe_output_name(name: str | None) -> str:
+    """Sanitize an output filename, defaulting to merged.pdf."""
+    if name:
+        safe = sanitize_filename(name)
+        if not safe.lower().endswith(".pdf"):
+            safe += ".pdf"
+    else:
+        safe = "merged.pdf"
+    return safe
 
 
 async def _check_rate_limit(redis: Redis, settings: Settings) -> None:
@@ -146,13 +158,8 @@ async def prepare_job(
     raw_options = body.options or {}
     options_dict = validate_options(raw_options)
 
-    # Sanitize output name
-    if body.output_name:
-        safe_output = sanitize_filename(body.output_name)
-        if not safe_output.lower().endswith(".pdf"):
-            safe_output += ".pdf"
-    else:
-        safe_output = None
+    # Sanitize output name with GRIDMERGE_ prefix
+    safe_output = _safe_output_name(body.output_name)
 
     # Create job in PENDING state (not enqueued yet — files haven't uploaded)
     job = Job(
@@ -170,6 +177,7 @@ async def prepare_job(
 @router.post("/jobs/{job_id}/start", status_code=202)
 async def start_job(
     job_id: str,
+    background_tasks: BackgroundTasks,
     redis: Redis = Depends(get_redis),
     settings: Settings = Depends(get_settings),
 ):
@@ -188,8 +196,9 @@ async def start_job(
     await arq.enqueue_job("process_merge_job", job_id)
     await arq.aclose()
 
-    await _ensure_worker_running(settings)
-    await _publish_queue_depth(redis, settings)
+    # Run AWS calls in background so response is instant
+    background_tasks.add_task(_ensure_worker_running, settings)
+    background_tasks.add_task(_publish_queue_depth, redis, settings)
 
     return {"job_id": job_id, "status": "processing"}
 
@@ -197,6 +206,7 @@ async def start_job(
 # --- Legacy multipart upload flow (local storage / fallback) ---
 @router.post("/jobs", status_code=202)
 async def create_job(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     options: str = Form(None),
     output_name: str = Form(None),
@@ -256,13 +266,8 @@ async def create_job(
         await storage.save(storage_key, data)
         filenames.append(file.filename)
 
-    # Sanitize the user-provided output name
-    if output_name:
-        safe_output = sanitize_filename(output_name)
-        if not safe_output.lower().endswith(".pdf"):
-            safe_output += ".pdf"
-    else:
-        safe_output = None
+    # Sanitize the user-provided output name with GRIDMERGE_ prefix
+    safe_output = _safe_output_name(output_name)
 
     # Create job record
     job = Job(
@@ -281,9 +286,9 @@ async def create_job(
     await arq.enqueue_job("process_merge_job", job_id)
     await arq.aclose()
 
-    # Wake up worker if scaled to zero
-    await _ensure_worker_running(settings)
-    await _publish_queue_depth(redis, settings)
+    # Run AWS calls in background so response is instant
+    background_tasks.add_task(_ensure_worker_running, settings)
+    background_tasks.add_task(_publish_queue_depth, redis, settings)
 
     return {"job_id": job_id, "status": job.status}
 
@@ -366,6 +371,7 @@ async def download_job(
 # Backwards-compatible sync endpoint
 @router.post("/merge-pdfs/")
 async def merge_pdfs_sync(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     options: str = Form(None),
     redis: Redis = Depends(get_redis),
@@ -373,7 +379,7 @@ async def merge_pdfs_sync(
     settings: Settings = Depends(get_settings),
 ):
     """Synchronous wrapper: creates a job, polls until done, returns PDF."""
-    response = await create_job(files, options, None, redis, storage, settings)
+    response = await create_job(background_tasks, files, options, None, redis, storage, settings)
     job_id = response["job_id"]
 
     for _ in range(300):
